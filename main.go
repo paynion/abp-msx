@@ -378,6 +378,7 @@ func main() {
 	pidsFile := filepath.Join(logDir, ".pids.json")
 
 	composeProject := strings.ToLower(profile.Containers.ServiceName)
+	InitTheme() // dark/light detection before TUI so termenv doesn't block
 	m := newModel(services, rootDir, logDir, pidsFile, composeProject, project)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {

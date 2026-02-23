@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // ── Styles ────────────────────────────────────────────────────
@@ -20,12 +23,17 @@ var (
 	dim     = lipgloss.Color("#6B7280")
 	white   = lipgloss.Color("#F9FAFB")
 	surface = lipgloss.Color("#1F2937")
+	border  = lipgloss.Color("#374151")
 
 	bannerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(accent).
 			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#374151")).
+			BorderForeground(border).
+			BorderBottom(true).
+			BorderTop(true).
+			BorderLeft(true).
+			BorderRight(true).
 			Padding(0, 2).
 			Align(lipgloss.Center)
 
@@ -33,52 +41,77 @@ var (
 			Foreground(dim).
 			Bold(true).
 			MarginLeft(2).
-			MarginTop(1)
+			MarginTop(1).
+			Padding(0, 0, 0, 1)
 
 	selectedSectionStyle = lipgloss.NewStyle().
 				Bold(true).
-				MarginLeft(1).
+				MarginLeft(2).
+				MarginTop(1).
 				Foreground(accent).
-				Background(surface)
+				Background(surface).
+				Padding(0, 0, 0, 1)
 
+	// Item rows: same left width so UP/DOWN don't shift when selecting (7 chars: 4 pad + " ▸ " for selected, 7 pad for unselected)
 	itemStyle = lipgloss.NewStyle().
-			PaddingLeft(4)
+			PaddingLeft(7)
 
 	selectedItemStyle = lipgloss.NewStyle().
-				PaddingLeft(2).
+				PaddingLeft(4).
 				Bold(true).
 				Background(surface).
 				Foreground(white)
 
+	// Badges with padding for alignment (status column width)
 	upBadge = lipgloss.NewStyle().
 		Foreground(green).
-		Bold(true)
+		Bold(true).
+		Padding(0, 1)
 
 	downBadge = lipgloss.NewStyle().
 			Foreground(red).
-			Bold(true)
+			Bold(true).
+			Padding(0, 1)
 
 	extBadge = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#A78BFA")).
-			Bold(true)
+			Bold(true).
+			Padding(0, 1)
 
 	startingBadge = lipgloss.NewStyle().
 			Foreground(yellow).
-			Bold(true)
+			Bold(true).
+			Padding(0, 1)
 
 	retryBadge = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#F97316")).
-			Bold(true)
+			Bold(true).
+			Padding(0, 1)
 
 	dotUp       = lipgloss.NewStyle().Foreground(green).Render("●")
 	dotDown     = lipgloss.NewStyle().Foreground(red).Render("○")
 	dotExt      = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Render("◆")
 	dotStarting = lipgloss.NewStyle().Foreground(yellow).Render("◐")
 
+	// Selected row: same colors but with background so text doesn't lose selection bg
+	dotUpSel       = lipgloss.NewStyle().Foreground(green).Background(surface).Render("●")
+	dotDownSel     = lipgloss.NewStyle().Foreground(red).Background(surface).Render("○")
+	dotExtSel      = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Background(surface).Render("◆")
+	dotStartingSel = lipgloss.NewStyle().Foreground(yellow).Background(surface).Render("◐")
+	upBadgeSel     = lipgloss.NewStyle().Foreground(green).Bold(true).Background(surface).Padding(0, 1)
+	downBadgeSel   = lipgloss.NewStyle().Foreground(red).Bold(true).Background(surface).Padding(0, 1)
+	extBadgeSel    = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Bold(true).Background(surface).Padding(0, 1)
+	startingBadgeSel = lipgloss.NewStyle().Foreground(yellow).Bold(true).Background(surface).Padding(0, 1)
+	retryBadgeSel   = lipgloss.NewStyle().Foreground(lipgloss.Color("#F97316")).Bold(true).Background(surface).Padding(0, 1)
+
 	helpBar = lipgloss.NewStyle().
 		Foreground(dim).
 		MarginTop(1).
-		MarginLeft(2)
+		MarginLeft(2).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#374151")).
+		BorderTop(true).
+		PaddingTop(1)
 
 	helpKey = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#9CA3AF")).
@@ -86,16 +119,54 @@ var (
 
 	statusBar = lipgloss.NewStyle().
 			Foreground(yellow).
-			MarginLeft(2)
+			Background(surface).
+			MarginLeft(0).
+			Padding(0, 2)
+
+	// Light mode: arka plan yok, metin okunaklı
+	statusBarLight = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#B45309")).
+			MarginLeft(0).
+			Padding(0, 2)
+
+	summaryRunning = lipgloss.NewStyle().Foreground(green).Bold(true)
+	summaryDown    = lipgloss.NewStyle().Foreground(dim)
+
+	// Padding to fill selection background to full row width
+	surfacePadStyle = lipgloss.NewStyle().Background(surface)
+	// Selected row prefix " ▸ " with surface bg (no padding on row style so we control full width)
+	selectedPrefixStyle = lipgloss.NewStyle().Background(surface).Foreground(white).Bold(true)
 
 	logHeaderStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(accent).
-			Padding(0, 1)
+			Padding(0, 1).
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(border).
+			BorderBottom(true).
+			PaddingBottom(0)
 
-	logBorderStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#374151"))
+	// Light mode log: daha açık border (sadece header border)
+	logHeaderStyleLight = logHeaderStyle.Copy().
+				BorderForeground(lipgloss.Color("#9CA3AF"))
 )
+
+var (
+	darkBackgroundOnce sync.Once
+	cachedDarkBg       bool
+)
+
+// InitTheme detects dark/light background once. Call from main before tea.Run() so termenv doesn't run during TUI (can block).
+func InitTheme() {
+	_ = hasDarkBackground()
+}
+
+func hasDarkBackground() bool {
+	darkBackgroundOnce.Do(func() {
+		cachedDarkBg = termenv.NewOutput(os.Stdout).HasDarkBackground()
+	})
+	return cachedDarkBg
+}
 
 // ── Row abstraction ──────────────────────────────────────────
 
@@ -139,6 +210,9 @@ type retryServiceMsg int // service index to retry
 // delayedRetryCheckMsg runs after a start; re-check startedIndices and schedule retry for any still Down/External (handles race where service was Starting at actionDoneMsg time)
 type delayedRetryCheckMsg struct{ indices []int }
 
+// asyncRefreshMsg is sent periodically while an async Cmd runs so the UI can re-render (don't freeze)
+type asyncRefreshMsg struct{}
+
 const (
 	viewList = iota
 	viewLogs
@@ -166,9 +240,10 @@ type model struct {
 	width          int
 	height         int
 	statusMsg      string
-	logVP          viewport.Model
-	logService     int
-	logUserScroll  bool
+	logVP            viewport.Model
+	logService       int
+	logUserScroll    bool
+	pendingAsyncCmd  tea.Cmd // işlem bitene kadar her asyncRefreshMsg'da tekrar çalıştırılır (UI kilitlenmesin)
 }
 
 func newModel(services []Service, rootDir, logDir, pidsFile, composeProject, projectName string) model {
@@ -212,19 +287,34 @@ func tickLogs() tea.Cmd {
 }
 
 const (
-	statusTickInterval = 3 * time.Second
-	logTickInterval    = 2 * time.Second
-	retryDelay         = 5 * time.Second
-	logTailLines       = 500
-	logViewChrome      = 4  // height reserved for log header/footer
-	listChrome         = 10 // height reserved for banner, summary, help in list view
-	minListVisible     = 5
+	statusTickInterval   = 2 * time.Second
+	logTickInterval      = 2 * time.Second
+	retryDelay           = 5 * time.Second
+	logTailLines         = 500
+	logViewChrome        = 4  // height reserved for log header/footer
+	listChrome           = 10 // height reserved for summary, scroll hints, status, help
+	minListVisible       = 5
+	asyncRefreshInterval = 150 * time.Millisecond // UI yenileme aralığı (işlem sürerken donmasın)
 )
 
 func scheduleRetry(serviceIdx int) tea.Cmd {
 	return tea.Tick(retryDelay, func(time.Time) tea.Msg {
 		return retryServiceMsg(serviceIdx)
 	})
+}
+
+// runAsync runs fn in a goroutine; returned Cmd yields asyncRefreshMsg periodically so UI stays responsive, then the result.
+func runAsync(fn func() tea.Msg) tea.Cmd {
+	ch := make(chan tea.Msg, 1)
+	go func() { ch <- fn() }()
+	return func() tea.Msg {
+		select {
+		case msg := <-ch:
+			return msg
+		case <-time.After(asyncRefreshInterval):
+			return asyncRefreshMsg{}
+		}
+	}
 }
 
 func scheduleDelayedRetryCheck(indices []int) tea.Cmd {
@@ -299,6 +389,9 @@ func (m *model) adjustScroll() {
 
 func (m model) listVisibleHeight() int {
 	h := m.height - listChrome
+	if m.statusMsg != "" {
+		h-- // status bar bir satır kullanıyor, taşma olmasın
+	}
 	if h < minListVisible {
 		h = minListVisible
 	}
@@ -333,9 +426,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.retryScheduled[i] = true
 				retryCmds = append(retryCmds, scheduleRetry(i))
 			}
-			if (newSt == StatusDown || newSt == StatusExternal) && m.userStopped[i] {
-				m.userStopped[i] = false
-			}
+			// userStopped sadece kullanıcı servisi tekrar başlattığında temizlenir (X ile durdurulanlar retry'a düşmesin)
 			if newSt == StatusUp {
 				m.retryCount[i] = 0
 			}
@@ -353,7 +444,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.retryCancelled[idx] = false
 			return m, nil
 		}
-		return m, m.startService(idx)
+		cmd := m.startService(idx)
+		m.pendingAsyncCmd = cmd
+		return m, cmd
 
 	case logTickMsg:
 		if m.view == viewLogs && m.logService >= 0 && m.logService < len(m.services) {
@@ -366,11 +459,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickLogs()
 		}
 
+	case asyncRefreshMsg:
+		// UI yenilendi; işlem bitene kadar aynı Cmd'i tekrar çalıştır (donma olmasın)
+		if m.pendingAsyncCmd != nil {
+			return m, m.pendingAsyncCmd
+		}
+		return m, nil
+
 	case actionDoneMsg:
+		m.pendingAsyncCmd = nil
 		m.statusMsg = msg.message
 		for _, i := range msg.stoppedIndices {
 			if i >= 0 && i < len(m.services) {
 				m.userStopped[i] = true
+			}
+		}
+		for _, i := range msg.startedIndices {
+			if i >= 0 && i < len(m.services) {
+				m.userStopped[i] = false // kullanıcı bunları başlattı, down olursa retry yapılabilsin
 			}
 		}
 		for i, svc := range m.services {
@@ -495,12 +601,16 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", " ":
 		r := m.cursorRow()
 		if r.kind == rowSection {
-			return m, m.toggleSection(r.sectionName)
+			cmd := m.toggleSection(r.sectionName)
+			m.pendingAsyncCmd = cmd
+			return m, cmd
 		}
 		if m.statuses[r.serviceIdx] != StatusDown {
 			m.retryCount[r.serviceIdx] = 0
 			m.userStopped[r.serviceIdx] = true
-			return m, m.stopService(r.serviceIdx)
+			cmd := m.stopService(r.serviceIdx)
+			m.pendingAsyncCmd = cmd
+			return m, cmd
 		}
 		// Down: if in retry cycle, Enter = cancel retries (force DOWN); else start
 		if m.retryCount[r.serviceIdx] > 0 {
@@ -511,7 +621,10 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.retryCancelled[r.serviceIdx] = false
-		return m, m.startService(r.serviceIdx)
+		m.userStopped[r.serviceIdx] = false // kullanıcı tekrar başlattı, down olursa retry yapılabilsin
+		cmd := m.startService(r.serviceIdx)
+		m.pendingAsyncCmd = cmd
+		return m, cmd
 
 	case "l":
 		r := m.cursorRow()
@@ -550,7 +663,9 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		svc := m.services[r.serviceIdx]
 		if svc.URL != "" {
-			return m, m.killPortCmd(r.serviceIdx)
+			cmd := m.killPortCmd(r.serviceIdx)
+			m.pendingAsyncCmd = cmd
+			return m, cmd
 		}
 		m.statusMsg = "✗ No port to kill for this service"
 
@@ -570,9 +685,22 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "s":
-		return m, m.startAll()
+		cmd := m.startAll()
+		m.pendingAsyncCmd = cmd
+		return m, cmd
 	case "x":
-		return m, m.stopAll()
+		// Tüm retry'ları iptal et, tüm servisleri durdur, bir daha retry etme
+		for i := range m.services {
+			m.retryScheduled[i] = false
+			m.retryCount[i] = 0
+			m.retryCancelled[i] = true
+			if m.statuses[i] != StatusDown {
+				m.userStopped[i] = true
+			}
+		}
+		cmd := m.stopAll()
+		m.pendingAsyncCmd = cmd
+		return m, cmd
 	}
 
 	return m, nil
@@ -585,7 +713,7 @@ func (m model) updateLogView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "up", "k", "pgup":
 		m.logUserScroll = true
-	case "G", "end":
+	case "G", "g", "end":
 		m.logUserScroll = false
 	}
 	var cmd tea.Cmd
@@ -597,24 +725,26 @@ func (m model) updateLogView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) startService(idx int) tea.Cmd {
 	svc := m.services[idx]
-	return func() tea.Msg {
-		err := svc.Start(m.rootDir, m.logDir, m.pidsFile, m.composeProject)
+	rootDir, logDir, pidsFile, composeProject := m.rootDir, m.logDir, m.pidsFile, m.composeProject
+	return runAsync(func() tea.Msg {
+		err := svc.Start(rootDir, logDir, pidsFile, composeProject)
 		if err != nil {
 			return actionDoneMsg{message: fmt.Sprintf("✗ %s: %v", svc.Name, err)}
 		}
 		return actionDoneMsg{message: fmt.Sprintf("▲ Started %s", svc.Name), startedIndices: []int{idx}}
-	}
+	})
 }
 
 func (m model) stopService(idx int) tea.Cmd {
 	svc := m.services[idx]
-	return func() tea.Msg {
-		err := svc.Stop(m.rootDir, m.pidsFile, m.composeProject)
+	rootDir, pidsFile, composeProject := m.rootDir, m.pidsFile, m.composeProject
+	return runAsync(func() tea.Msg {
+		err := svc.Stop(rootDir, pidsFile, composeProject)
 		if err != nil {
 			return actionDoneMsg{message: fmt.Sprintf("✗ %s: %v", svc.Name, err)}
 		}
 		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %s", svc.Name), stoppedIndices: []int{idx}}
-	}
+	})
 }
 
 func (m model) toggleSection(sectionName string) tea.Cmd {
@@ -633,7 +763,7 @@ func (m model) toggleSection(sectionName string) tea.Cmd {
 	composeProject := m.composeProject
 	services := m.services
 
-	return func() tea.Msg {
+	return runAsync(func() tea.Msg {
 		if len(toStart) > 0 {
 			for _, idx := range toStart {
 				services[idx].Start(rootDir, logDir, pidsFile, composeProject)
@@ -650,18 +780,18 @@ func (m model) toggleSection(sectionName string) tea.Cmd {
 			message:        fmt.Sprintf("▼ Stopped %d services in %s", len(toStop), sectionName),
 			stoppedIndices: toStop,
 		}
-	}
+	})
 }
 
 func (m model) killPortCmd(idx int) tea.Cmd {
 	svc := m.services[idx]
-	return func() tea.Msg {
+	return runAsync(func() tea.Msg {
 		msg, err := killPort(svc.URL)
 		if err != nil {
 			return actionDoneMsg{message: fmt.Sprintf("✗ %s: %v", svc.Name, err)}
 		}
 		return actionDoneMsg{message: fmt.Sprintf("☠ %s: %s", svc.Name, msg)}
-	}
+	})
 }
 
 func (m model) startAll() tea.Cmd {
@@ -677,7 +807,7 @@ func (m model) startAll() tea.Cmd {
 	composeProject := m.composeProject
 	services := m.services
 
-	return func() tea.Msg {
+	return runAsync(func() tea.Msg {
 		for _, idx := range toStart {
 			services[idx].Start(rootDir, logDir, pidsFile, composeProject)
 		}
@@ -685,20 +815,24 @@ func (m model) startAll() tea.Cmd {
 			message:        fmt.Sprintf("▲ Started %d services", len(toStart)),
 			startedIndices: toStart,
 		}
-	}
+	})
 }
 
 func (m model) stopAll() tea.Cmd {
-	return func() tea.Msg {
+	rootDir := m.rootDir
+	pidsFile := m.pidsFile
+	composeProject := m.composeProject
+	services := m.services
+	return runAsync(func() tea.Msg {
 		var stopped []int
-		for i, svc := range m.services {
+		for i, svc := range services {
 			if m.statuses[i] != StatusDown {
-				svc.Stop(m.rootDir, m.pidsFile, m.composeProject)
+				svc.Stop(rootDir, pidsFile, composeProject)
 				stopped = append(stopped, i)
 			}
 		}
 		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %d services", len(stopped)), stoppedIndices: stopped}
-	}
+	})
 }
 
 // ── View ──────────────────────────────────────────────────────
@@ -718,23 +852,30 @@ func (m model) viewListScreen() string {
 		w = 60
 	}
 
-	banner := bannerStyle.Width(w - 4).Render("abp-msx — " + m.projectName)
-	b.WriteString("\n" + banner + "\n")
-
 	upCount := 0
 	extCount := 0
+	downCount := 0
 	for _, s := range m.statuses {
-		if s == StatusUp {
+		switch s {
+		case StatusUp:
 			upCount++
-		} else if s == StatusExternal {
+		case StatusExternal:
 			extCount++
+		default:
+			downCount++
 		}
 	}
-	summaryText := fmt.Sprintf("  %d/%d running", upCount+extCount, len(m.services))
-	if extCount > 0 {
-		summaryText += fmt.Sprintf("  (%d external)", extCount)
+	running := upCount + extCount
+	summaryParts := []string{
+		summaryRunning.Render(fmt.Sprintf("● %d running", running)),
+		summaryDown.Render(fmt.Sprintf("○ %d down", downCount)),
 	}
-	summary := lipgloss.NewStyle().Foreground(dim).MarginLeft(2).Render(summaryText)
+	if extCount > 0 {
+		summaryParts = append(summaryParts, summaryDown.Render(fmt.Sprintf("◆ %d external", extCount)))
+	}
+	summary := lipgloss.NewStyle().Foreground(dim).MarginLeft(2).Render(
+		strings.Join(summaryParts, "   "),
+	)
 	b.WriteString(summary + "\n")
 
 	type renderedLine struct {
@@ -753,7 +894,7 @@ func (m model) viewListScreen() string {
 
 			if selected {
 				allLines = append(allLines, renderedLine{
-					text: selectedSectionStyle.Render(" ▸ " + strings.ToUpper(r.sectionName) + badge),
+					text: selectedSectionStyle.Width(w - 2).Render(" ▸ " + strings.ToUpper(r.sectionName) + badge),
 				})
 			} else {
 				allLines = append(allLines, renderedLine{
@@ -766,36 +907,77 @@ func (m model) viewListScreen() string {
 		svc := m.services[r.serviceIdx]
 		st := m.statuses[r.serviceIdx]
 
-		var dot, badgeText string
-		switch st {
-		case StatusUp:
-			dot = dotUp
-			badgeText = upBadge.Render("  UP")
-		case StatusExternal:
-			dot = dotExt
-			if n := m.retryCount[r.serviceIdx]; n > 0 {
-				badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
-			} else {
-				badgeText = extBadge.Render(" EXT")
+		var dot, badgeText, nameStr, badgeStr string
+		nameStr = fmt.Sprintf("%-30s", svc.Name)
+		if selected {
+			nameStr = lipgloss.NewStyle().Background(surface).Foreground(white).Render(nameStr)
+			switch st {
+			case StatusUp:
+				dot, badgeStr = dotUpSel, "  UP"
+				badgeText = upBadgeSel.Render(badgeStr)
+			case StatusExternal:
+				dot = dotExtSel
+				if n := m.retryCount[r.serviceIdx]; n > 0 {
+					badgeStr = fmt.Sprintf("RETRY (%d)", n)
+					badgeText = retryBadgeSel.Render(badgeStr)
+				} else {
+					badgeStr = " EXT"
+					badgeText = extBadgeSel.Render(badgeStr)
+				}
+			case StatusStarting:
+				dot, badgeStr = dotStartingSel, "STARTING"
+				badgeText = startingBadgeSel.Render(badgeStr)
+			default:
+				dot = dotDownSel
+				if n := m.retryCount[r.serviceIdx]; n > 0 {
+					badgeStr = fmt.Sprintf("RETRY (%d)", n)
+					badgeText = retryBadgeSel.Render(badgeStr)
+				} else {
+					badgeStr = "DOWN"
+					badgeText = downBadgeSel.Render(badgeStr)
+				}
 			}
-		case StatusStarting:
-			dot = dotStarting
-			badgeText = startingBadge.Render("STARTING")
-		default:
-			dot = dotDown
-			if n := m.retryCount[r.serviceIdx]; n > 0 {
-				badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
-			} else {
-				badgeText = downBadge.Render("DOWN")
+		} else {
+			switch st {
+			case StatusUp:
+				dot = dotUp
+				badgeText = upBadge.Render("  UP")
+			case StatusExternal:
+				dot = dotExt
+				if n := m.retryCount[r.serviceIdx]; n > 0 {
+					badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
+				} else {
+					badgeText = extBadge.Render(" EXT")
+				}
+			case StatusStarting:
+				dot = dotStarting
+				badgeText = startingBadge.Render("STARTING")
+			default:
+				dot = dotDown
+				if n := m.retryCount[r.serviceIdx]; n > 0 {
+					badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
+				} else {
+					badgeText = downBadge.Render("DOWN")
+				}
 			}
 		}
 
-		name := fmt.Sprintf("%-28s", svc.Name)
-		line := fmt.Sprintf("%s  %s  %s", dot, name, badgeText)
-
 		if selected {
-			allLines = append(allLines, renderedLine{text: selectedItemStyle.Render(" ▸ " + line)})
+			// Circle–isim–status arasındaki boşluklar da surface arka planı alsın (aralar background color işlesin).
+			line := dot + surfacePadStyle.Render("  ") + nameStr + surfacePadStyle.Render("  ") + badgeText
+			// Satırı baştan sona surface ile doldur (sol/sağ padding dahil).
+			contentWidth := 4 + 3 + 1 + 2 + 30 + 2 + len(badgeStr) + 2
+			pad := w - contentWidth
+			if pad < 0 {
+				pad = 0
+			}
+			fullLine := surfacePadStyle.Render("    ") +
+				selectedPrefixStyle.Render(" ▸ ") +
+				line +
+				surfacePadStyle.Render(strings.Repeat(" ", pad))
+			allLines = append(allLines, renderedLine{text: fullLine})
 		} else {
+			line := fmt.Sprintf("%s  %s  %s", dot, nameStr, badgeText)
 			allLines = append(allLines, renderedLine{text: itemStyle.Render(line)})
 		}
 	}
@@ -811,60 +993,108 @@ func (m model) viewListScreen() string {
 	}
 
 	end := offset + visible
+	// İlk görünen satır item ise grup başlığını sticky göster; alttaki satırı kesmemek için sadece "ortada" iken
+	needStickySection := offset > 0 && offset < len(m.rows) && m.rows[offset].kind == rowItem && (offset+visible < total)
+	if needStickySection {
+		end = offset + visible - 1
+	}
 	if end > total {
 		end = total
 	}
 
 	if offset > 0 {
-		b.WriteString(lipgloss.NewStyle().Foreground(dim).MarginLeft(4).Render(fmt.Sprintf("  ▲ %d more above", offset)) + "\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(dim).MarginLeft(4).Render(fmt.Sprintf("↑ %d above", offset)) + "\n")
 	}
-
+	if needStickySection {
+		sectionName := ""
+		for i := offset - 1; i >= 0; i-- {
+			if m.rows[i].kind == rowSection {
+				sectionName = m.rows[i].sectionName
+				break
+			}
+		}
+		if sectionName != "" {
+			up, ext, dn := m.sectionSummary(sectionName)
+			running := up + ext
+			totalSec := up + ext + dn
+			badge := fmt.Sprintf(" (%d/%d)", running, totalSec)
+			b.WriteString(sectionStyle.Render(strings.ToUpper(sectionName)+badge) + "\n")
+		}
+	}
 	for i := offset; i < end; i++ {
 		b.WriteString(allLines[i].text + "\n")
 	}
 
 	if end < total {
-		b.WriteString(lipgloss.NewStyle().Foreground(dim).MarginLeft(4).Render(fmt.Sprintf("  ▼ %d more below", total-end)) + "\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(dim).MarginLeft(4).Render(fmt.Sprintf("↓ %d below", total-end)) + "\n")
 	}
 
 	b.WriteString("\n")
 	if m.statusMsg != "" {
-		b.WriteString(statusBar.Render(m.statusMsg) + "\n")
+		sb := statusBar
+		if !hasDarkBackground() {
+			sb = statusBarLight
+		}
+		b.WriteString(sb.Render(" "+m.statusMsg) + "\n")
 	}
 
-	help := fmt.Sprintf(
-		"  %s navigate  %s start/stop  %s logs  %s open  %s kill port  %s folder\n  %s start all  %s stop all  %s quit",
+	appTitle := lipgloss.NewStyle().Bold(true).Foreground(accent).Render("abp-msx — " + m.projectName)
+	help1 := fmt.Sprintf("%s nav  %s start/stop  %s logs  %s open  %s kill  %s folder",
 		helpKey.Render("↑↓"),
 		helpKey.Render("Enter"),
 		helpKey.Render("L"),
 		helpKey.Render("O"),
-		helpKey.Render("Shift+K"),
+		helpKey.Render("K"),
 		helpKey.Render("F"),
+	)
+	help2 := fmt.Sprintf("%s start all  %s stop all  %s quit",
 		helpKey.Render("S"),
 		helpKey.Render("X"),
-		helpKey.Render("Q"),
+		helpKey.Render("q"),
 	)
-	b.WriteString(helpBar.Render(help) + "\n")
+	b.WriteString(helpBar.Render(" "+appTitle+"  ·  "+help1+"  ·  "+help2) + "\n")
 
 	return b.String()
 }
 
 func (m model) viewLogScreen() string {
 	var b strings.Builder
+	dark := hasDarkBackground()
+	headerStyle := logHeaderStyle
+	primaryFg := white
+	if !dark {
+		headerStyle = logHeaderStyleLight
+		primaryFg = lipgloss.Color("#111827")
+	}
 	if m.logService < 0 || m.logService >= len(m.services) {
-		b.WriteString(logHeaderStyle.Render("  Invalid service · Q back") + "\n")
+		b.WriteString(headerStyle.Render("  Invalid service · q back") + "\n")
 		return b.String()
 	}
 	svc := m.services[m.logService]
+	st := m.statuses[m.logService]
+	var statusDot string
+	switch st {
+	case StatusUp:
+		statusDot = dotUp
+	case StatusExternal:
+		statusDot = dotExt
+	case StatusStarting:
+		statusDot = dotStarting
+	default:
+		statusDot = dotDown
+	}
 
 	scrollHint := ""
 	if m.logUserScroll {
-		scrollHint = lipgloss.NewStyle().Foreground(yellow).Render("  (paused - press G to resume)")
+		scrollHint = "  " + lipgloss.NewStyle().Foreground(yellow).Render("⏸ paused · G resume")
 	}
-
-	header := fmt.Sprintf("  %s  %s%s", svc.Name, lipgloss.NewStyle().Foreground(dim).Render("Q back · ↑↓ scroll"), scrollHint)
-	b.WriteString(logHeaderStyle.Render(header) + "\n")
-	b.WriteString(logBorderStyle.Render(strings.Repeat("─", m.width)) + "\n")
+	header := fmt.Sprintf("  %s %s  %s%s",
+		statusDot,
+		lipgloss.NewStyle().Bold(true).Foreground(primaryFg).Render(svc.Name),
+		lipgloss.NewStyle().Foreground(dim).Render("q back · ↑↓ scroll"),
+		scrollHint,
+	)
+	b.WriteString(headerStyle.Render(header) + "\n")
 	b.WriteString(m.logVP.View())
 	b.WriteString("\n")
 
