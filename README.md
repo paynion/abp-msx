@@ -13,37 +13,52 @@ Lightweight TUI to run and manage [ABP Framework](https://abp.io) microservice s
 ## Requirements
 
 - An ABP solution with **ABP Studio** run profiles: directory `etc/abp-studio` and `etc/abp-studio/run-profiles/*.abprun.json`.
-- **Go 1.21+** to build.
 - **Docker** (for container services) and **.NET SDK** (for .NET applications), as defined in your profile.
 
 ## Install
+
+1. Open the [Releases](https://github.com/paynion/abp-msx/releases) page and download the executable that matches your operating system and architecture (e.g. `abp-msx-linux-amd64`, `abp-msx-darwin-arm64`, `abp-msx-windows-amd64.exe`).
+2. Rename the file to **`abp-msx`** (on Windows: **`abp-msx.exe`**).
+3. Move it to a directory that is in your [PATH](https://en.wikipedia.org/wiki/PATH_(variable)) so you can run it from any terminal:
+   - **Linux / macOS:** e.g. `~/bin` or `/usr/local/bin`  
+     `mv abp-msx-linux-amd64 ~/bin/abp-msx` then ensure `~/bin` is in your PATH.
+   - **Windows:** e.g. `C:\Program Files\abp-msx` or a folder already in PATH — add that folder to [System PATH](https://docs.microsoft.com/en-us/windows/win32/progthand/environment-variables) if needed.
+
+After that, you can run from any terminal:
+
+```bash
+abp-msx -d /path/to/your/abp-solution
+```
+
+### Build from source
+
+If you prefer to build yourself (requires [Go 1.21+](https://go.dev/dl/)):
 
 ```bash
 git clone https://github.com/paynion/abp-msx.git
 cd abp-msx
 go build -o abp-msx .
-# optional: copy to PATH
-# cp abp-msx /usr/local/bin/
+# then move abp-msx to a directory in your PATH (see above)
 ```
 
-Cross-build (see `Makefile`):
+Cross-build for all platforms (see `Makefile`):
 
 ```bash
-make all   # builds linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64, windows-arm64 in dist/
+make all   # outputs to dist/
 ```
 
 ## Usage
 
-From your ABP solution root (the one that contains `etc/abp-studio`):
+From any directory, point to your ABP solution root:
 
 ```bash
-./abp-msx
+abp-msx -d /path/to/your/abp-solution
 ```
 
-Or from any directory:
+If you are already inside the ABP solution root (directory that contains `etc/abp-studio`), you can run:
 
 ```bash
-./abp-msx -d /path/to/your/abp-solution
+abp-msx
 ```
 
 - If there is **one** run profile, it is used automatically.
