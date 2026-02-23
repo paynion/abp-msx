@@ -4,8 +4,6 @@ Lightweight TUI to run and manage [ABP Framework](https://abp.io) microservice s
 
 ![Demo](demo.gif)
 
-*(Add a `demo.gif` in the repo root to show a short recording of the TUI.)*
-
 ## Purpose
 
 - **Lightweight** — Single binary, no extra runtime; uses your existing Docker and .NET SDK.
