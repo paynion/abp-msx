@@ -37,7 +37,8 @@ type ServiceStatus int
 
 const (
 	StatusDown     ServiceStatus = iota
-	StatusUp                     // started by us (PID tracked)
+	StatusStarting               // process started but not yet reachable (e.g. still building)
+	StatusUp                     // started by us and reachable
 	StatusExternal               // port is open but not our PID
 )
 
@@ -49,11 +50,22 @@ func (s Service) GetStatus(pidsFile string) ServiceStatus {
 		}
 		return StatusDown
 	case KindDotNet, KindCLI:
-		if processIsRunning(pidsFile, s.Name) {
-			return StatusUp
+		processRunning := processIsRunning(pidsFile, s.Name)
+		if s.URL != "" {
+			portOpen := isPortOpen(s.URL)
+			if processRunning && portOpen {
+				return StatusUp
+			}
+			if processRunning && !portOpen {
+				return StatusStarting
+			}
+			if !processRunning && portOpen {
+				return StatusExternal
+			}
+			return StatusDown
 		}
-		if s.URL != "" && isPortOpen(s.URL) {
-			return StatusExternal
+		if processRunning {
+			return StatusUp
 		}
 		return StatusDown
 	}
@@ -61,7 +73,21 @@ func (s Service) GetStatus(pidsFile string) ServiceStatus {
 }
 
 func (s Service) IsUp(pidsFile string) bool {
-	return s.GetStatus(pidsFile) != StatusDown
+	st := s.GetStatus(pidsFile)
+	return st == StatusUp || st == StatusExternal
+}
+
+// WorkingDirectory returns the filesystem path to open in a file explorer for this service.
+func (s Service) WorkingDirectory(rootDir string) string {
+	switch s.Kind {
+	case KindDotNet:
+		return filepath.Dir(s.CsprojPath)
+	case KindCLI:
+		return s.WorkDir
+	case KindContainer:
+		return filepath.Join(rootDir, "etc", "docker", "containers")
+	}
+	return rootDir
 }
 
 func (s Service) Start(rootDir, logDir, pidsFile, composeProject string) error {
@@ -156,7 +182,9 @@ func loadPids(path string) map[string]int {
 	if err != nil {
 		return pids
 	}
-	json.Unmarshal(data, &pids)
+	if err := json.Unmarshal(data, &pids); err != nil {
+		return pids
+	}
 	return pids
 }
 
@@ -268,40 +296,19 @@ func portFromURL(rawURL string) string {
 	return port
 }
 
+const portCheckTimeout = 500 * time.Millisecond
+
 func isPortOpen(rawURL string) bool {
 	port := portFromURL(rawURL)
 	if port == "" {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", "localhost:"+port, 500*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", "localhost:"+port, portCheckTimeout)
 	if err != nil {
 		return false
 	}
 	conn.Close()
 	return true
-}
-
-func killPort(rawURL string) (string, error) {
-	port := portFromURL(rawURL)
-	if port == "" {
-		return "", fmt.Errorf("could not extract port from URL")
-	}
-
-	out, err := exec.Command("lsof", "-ti", "tcp:"+port, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return "", fmt.Errorf("no process found on port %s", port)
-	}
-
-	pids := strings.Fields(strings.TrimSpace(string(out)))
-	if len(pids) == 0 {
-		return "", fmt.Errorf("no process found on port %s", port)
-	}
-
-	for _, p := range pids {
-		exec.Command("kill", "-9", p).Run()
-	}
-
-	return fmt.Sprintf("killed %d process(es) on port %s (PIDs: %s)", len(pids), port, strings.Join(pids, ", ")), nil
 }
 
 func openBrowser(rawURL string) error {
@@ -313,6 +320,25 @@ func openBrowser(rawURL string) error {
 		cmd = exec.Command("xdg-open", rawURL)
 	case "windows":
 		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+	return cmd.Start()
+}
+
+func openFileExplorer(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", absDir)
+	case "linux":
+		cmd = exec.Command("xdg-open", absDir)
+	case "windows":
+		cmd = exec.Command("explorer", absDir)
 	default:
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}

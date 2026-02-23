@@ -321,11 +321,14 @@ func selectProfile(profiles []string, project string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	chosen := result.(profilePickerModel).chosen
-	if chosen == "" {
+	m, ok := result.(profilePickerModel)
+	if !ok {
 		return "", fmt.Errorf("no profile selected")
 	}
-	return chosen, nil
+	if m.chosen == "" {
+		return "", fmt.Errorf("no profile selected")
+	}
+	return m.chosen, nil
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -368,7 +371,10 @@ func main() {
 
 	services := buildServices(rootDir, profilePath, profile)
 	logDir := filepath.Join(rootDir, "logs")
-	os.MkdirAll(logDir, 0755)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	pidsFile := filepath.Join(logDir, ".pids.json")
 
 	composeProject := strings.ToLower(profile.Containers.ServiceName)

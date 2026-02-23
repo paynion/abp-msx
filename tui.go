@@ -62,9 +62,18 @@ var (
 			Foreground(lipgloss.Color("#A78BFA")).
 			Bold(true)
 
-	dotUp   = lipgloss.NewStyle().Foreground(green).Render("●")
-	dotDown = lipgloss.NewStyle().Foreground(red).Render("○")
-	dotExt  = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Render("◆")
+	startingBadge = lipgloss.NewStyle().
+			Foreground(yellow).
+			Bold(true)
+
+	retryBadge = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F97316")).
+			Bold(true)
+
+	dotUp       = lipgloss.NewStyle().Foreground(green).Render("●")
+	dotDown     = lipgloss.NewStyle().Foreground(red).Render("○")
+	dotExt      = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Render("◆")
+	dotStarting = lipgloss.NewStyle().Foreground(yellow).Render("◐")
 
 	helpBar = lipgloss.NewStyle().
 		Foreground(dim).
@@ -120,7 +129,15 @@ func buildRows(services []Service) []row {
 
 type statusTickMsg time.Time
 type logTickMsg time.Time
-type actionDoneMsg struct{ message string }
+type actionDoneMsg struct {
+	message        string
+	startedIndices []int // indices we just started (for retry: if still Down, schedule retry)
+	stoppedIndices []int // indices we just stopped (set userStopped so we don't auto-retry)
+}
+type retryServiceMsg int // service index to retry
+
+// delayedRetryCheckMsg runs after a start; re-check startedIndices and schedule retry for any still Down/External (handles race where service was Starting at actionDoneMsg time)
+type delayedRetryCheckMsg struct{ indices []int }
 
 const (
 	viewList = iota
@@ -132,6 +149,11 @@ const (
 type model struct {
 	services       []Service
 	statuses       []ServiceStatus
+	prevStatuses   []ServiceStatus // for detecting transition to down
+	retryCount     []int           // per-service retry attempt number (RETRY N)
+	retryScheduled []bool          // retry already scheduled for this down period
+	retryCancelled []bool          // user pressed Enter to stop retrying (force DOWN)
+	userStopped    []bool          // user explicitly stopped this service (don't auto-retry)
 	rows           []row
 	cursor         int // indexes into rows[]
 	scrollOffset   int
@@ -154,9 +176,16 @@ func newModel(services []Service, rootDir, logDir, pidsFile, composeProject, pro
 	for i, svc := range services {
 		statuses[i] = svc.GetStatus(pidsFile)
 	}
+	prevStatuses := make([]ServiceStatus, len(statuses))
+	copy(prevStatuses, statuses)
 	return model{
 		services:       services,
 		statuses:       statuses,
+		prevStatuses:   prevStatuses,
+		retryCount:     make([]int, len(services)),
+		retryScheduled: make([]bool, len(services)),
+		retryCancelled: make([]bool, len(services)),
+		userStopped:    make([]bool, len(services)),
 		rows:           buildRows(services),
 		rootDir:        rootDir,
 		logDir:         logDir,
@@ -171,20 +200,50 @@ func (m model) Init() tea.Cmd {
 }
 
 func tickStatus() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(statusTickInterval, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
 	})
 }
 
 func tickLogs() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(logTickInterval, func(t time.Time) tea.Msg {
 		return logTickMsg(t)
+	})
+}
+
+const (
+	statusTickInterval = 3 * time.Second
+	logTickInterval    = 2 * time.Second
+	retryDelay         = 5 * time.Second
+	logTailLines       = 500
+	logViewChrome      = 4  // height reserved for log header/footer
+	listChrome         = 10 // height reserved for banner, summary, help in list view
+	minListVisible     = 5
+)
+
+func scheduleRetry(serviceIdx int) tea.Cmd {
+	return tea.Tick(retryDelay, func(time.Time) tea.Msg {
+		return retryServiceMsg(serviceIdx)
+	})
+}
+
+func scheduleDelayedRetryCheck(indices []int) tea.Cmd {
+	if len(indices) == 0 {
+		return nil
+	}
+	indicesCopy := make([]int, len(indices))
+	copy(indicesCopy, indices)
+	return tea.Tick(retryDelay, func(time.Time) tea.Msg {
+		return delayedRetryCheckMsg{indices: indicesCopy}
 	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────
 
 func (m model) cursorRow() row {
+	if len(m.rows) == 0 || m.cursor < 0 || m.cursor >= len(m.rows) {
+		return row{kind: rowSection, sectionName: ""}
+	}
 	return m.rows[m.cursor]
 }
 
@@ -205,6 +264,8 @@ func (m model) sectionSummary(sectionName string) (up, ext, down int) {
 			up++
 		case StatusExternal:
 			ext++
+		case StatusStarting:
+			down++ // starting counts as not yet running
 		default:
 			down++
 		}
@@ -237,10 +298,9 @@ func (m *model) adjustScroll() {
 }
 
 func (m model) listVisibleHeight() int {
-	chrome := 10
-	h := m.height - chrome
-	if h < 5 {
-		h = 5
+	h := m.height - listChrome
+	if h < minListVisible {
+		h = minListVisible
 	}
 	return h
 }
@@ -254,18 +314,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.view == viewLogs {
 			m.logVP.Width = m.width
-			m.logVP.Height = m.height - 4
+			m.logVP.Height = m.height - logViewChrome
 		}
 
 	case statusTickMsg:
+		var retryCmds []tea.Cmd
 		for i, svc := range m.services {
-			m.statuses[i] = svc.GetStatus(m.pidsFile)
+			newSt := svc.GetStatus(m.pidsFile)
+			prev := m.prevStatuses[i]
+			m.statuses[i] = newSt
+			m.prevStatuses[i] = newSt
+			// Schedule retry when Down or External (port open but not our process - e.g. same port as another app)
+			needRetry := newSt == StatusDown || newSt == StatusExternal
+			shouldRetry := needRetry && !m.retryScheduled[i] && !m.userStopped[i] &&
+				((prev == StatusUp || prev == StatusStarting) || m.retryCount[i] > 0)
+			if shouldRetry {
+				m.retryCount[i]++
+				m.retryScheduled[i] = true
+				retryCmds = append(retryCmds, scheduleRetry(i))
+			}
+			if (newSt == StatusDown || newSt == StatusExternal) && m.userStopped[i] {
+				m.userStopped[i] = false
+			}
+			if newSt == StatusUp {
+				m.retryCount[i] = 0
+			}
 		}
-		return m, tickStatus()
+		cmds := append([]tea.Cmd{tickStatus()}, retryCmds...)
+		return m, tea.Batch(cmds...)
+
+	case retryServiceMsg:
+		idx := int(msg)
+		if idx < 0 || idx >= len(m.services) {
+			return m, nil
+		}
+		m.retryScheduled[idx] = false
+		if m.retryCancelled[idx] {
+			m.retryCancelled[idx] = false
+			return m, nil
+		}
+		return m, m.startService(idx)
 
 	case logTickMsg:
-		if m.view == viewLogs {
-			content := m.services[m.logService].LogContent(m.rootDir, m.logDir, 500)
+		if m.view == viewLogs && m.logService >= 0 && m.logService < len(m.services) {
+			content := m.services[m.logService].LogContent(m.rootDir, m.logDir, logTailLines)
 			wasAtBottom := m.logVP.AtBottom()
 			m.logVP.SetContent(content)
 			if wasAtBottom || !m.logUserScroll {
@@ -276,8 +368,68 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionDoneMsg:
 		m.statusMsg = msg.message
+		for _, i := range msg.stoppedIndices {
+			if i >= 0 && i < len(m.services) {
+				m.userStopped[i] = true
+			}
+		}
 		for i, svc := range m.services {
 			m.statuses[i] = svc.GetStatus(m.pidsFile)
+			if m.statuses[i] == StatusUp {
+				m.retryCount[i] = 0
+			}
+		}
+		var retryCmds []tea.Cmd
+		for _, i := range msg.startedIndices {
+			if i < 0 || i >= len(m.services) {
+				continue
+			}
+			st := m.statuses[i]
+			if st != StatusDown && st != StatusExternal {
+				continue
+			}
+			m.retryScheduled[i] = false
+			m.retryCount[i]++
+			m.retryScheduled[i] = true
+			retryCmds = append(retryCmds, scheduleRetry(i))
+		}
+		// Delayed check: in 5s re-check startedIndices; catches services that were Starting at actionDoneMsg and then crashed
+		if len(msg.startedIndices) > 0 {
+			retryCmds = append(retryCmds, scheduleDelayedRetryCheck(msg.startedIndices))
+		}
+		if len(retryCmds) > 0 {
+			return m, tea.Batch(retryCmds...)
+		}
+
+	case delayedRetryCheckMsg:
+		for i, svc := range m.services {
+			m.statuses[i] = svc.GetStatus(m.pidsFile)
+			if m.statuses[i] == StatusUp {
+				m.retryCount[i] = 0
+			}
+		}
+		var retryCmds []tea.Cmd
+		for _, i := range msg.indices {
+			if i < 0 || i >= len(m.services) {
+				continue
+			}
+			if m.userStopped[i] || m.retryScheduled[i] {
+				continue
+			}
+			// Only schedule if we didn't already in actionDoneMsg (retryCount was 0 then → was Starting)
+			if m.retryCount[i] > 0 {
+				continue
+			}
+			st := m.statuses[i]
+			if st != StatusDown && st != StatusExternal {
+				continue
+			}
+			m.retryCount[i]++
+			m.retryScheduled[i] = true
+			retryCmds = append(retryCmds, scheduleRetry(i))
+		}
+		if len(retryCmds) > 0 {
+			return m, tea.Batch(retryCmds...)
 		}
 
 	case tea.KeyMsg:
@@ -291,6 +443,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(m.rows) == 0 {
+		if msg.String() == "q" || msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+	if m.cursor >= len(m.rows) {
+		m.cursor = len(m.rows) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -334,8 +498,19 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.toggleSection(r.sectionName)
 		}
 		if m.statuses[r.serviceIdx] != StatusDown {
+			m.retryCount[r.serviceIdx] = 0
+			m.userStopped[r.serviceIdx] = true
 			return m, m.stopService(r.serviceIdx)
 		}
+		// Down: if in retry cycle, Enter = cancel retries (force DOWN); else start
+		if m.retryCount[r.serviceIdx] > 0 {
+			m.retryCount[r.serviceIdx] = 0
+			m.retryScheduled[r.serviceIdx] = false
+			m.retryCancelled[r.serviceIdx] = true
+			m.statusMsg = fmt.Sprintf("▼ %s — retry cancelled", m.services[r.serviceIdx].Name)
+			return m, nil
+		}
+		m.retryCancelled[r.serviceIdx] = false
 		return m, m.startService(r.serviceIdx)
 
 	case "l":
@@ -347,8 +522,8 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = viewLogs
 		m.logService = r.serviceIdx
 		m.logUserScroll = false
-		m.logVP = viewport.New(m.width, m.height-4)
-		content := m.services[r.serviceIdx].LogContent(m.rootDir, m.logDir, 500)
+		m.logVP = viewport.New(m.width, m.height-logViewChrome)
+		content := m.services[r.serviceIdx].LogContent(m.rootDir, m.logDir, logTailLines)
 		m.logVP.SetContent(content)
 		m.logVP.GotoBottom()
 		return m, tickLogs()
@@ -378,6 +553,21 @@ func (m model) updateListView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.killPortCmd(r.serviceIdx)
 		}
 		m.statusMsg = "✗ No port to kill for this service"
+
+	case "f":
+		r := m.cursorRow()
+		if r.kind != rowItem {
+			m.statusMsg = "✗ Select a service to open folder"
+			return m, nil
+		}
+		svc := m.services[r.serviceIdx]
+		dir := svc.WorkingDirectory(m.rootDir)
+		if err := openFileExplorer(dir); err != nil {
+			m.statusMsg = fmt.Sprintf("✗ Open folder: %v", err)
+		} else {
+			m.statusMsg = fmt.Sprintf("📂 %s → %s", svc.Name, dir)
+		}
+		return m, nil
 
 	case "s":
 		return m, m.startAll()
@@ -412,7 +602,7 @@ func (m model) startService(idx int) tea.Cmd {
 		if err != nil {
 			return actionDoneMsg{message: fmt.Sprintf("✗ %s: %v", svc.Name, err)}
 		}
-		return actionDoneMsg{message: fmt.Sprintf("▲ Started %s", svc.Name)}
+		return actionDoneMsg{message: fmt.Sprintf("▲ Started %s", svc.Name), startedIndices: []int{idx}}
 	}
 }
 
@@ -423,38 +613,43 @@ func (m model) stopService(idx int) tea.Cmd {
 		if err != nil {
 			return actionDoneMsg{message: fmt.Sprintf("✗ %s: %v", svc.Name, err)}
 		}
-		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %s", svc.Name)}
+		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %s", svc.Name), stoppedIndices: []int{idx}}
 	}
 }
 
 func (m model) toggleSection(sectionName string) tea.Cmd {
 	indices := m.sectionServiceIndices(sectionName)
-	allUp := true
+	var toStart, toStop []int
 	for _, idx := range indices {
 		if m.statuses[idx] == StatusDown {
-			allUp = false
-			break
+			toStart = append(toStart, idx)
+		} else {
+			toStop = append(toStop, idx)
 		}
 	}
+	rootDir := m.rootDir
+	logDir := m.logDir
+	pidsFile := m.pidsFile
+	composeProject := m.composeProject
+	services := m.services
 
 	return func() tea.Msg {
-		count := 0
-		if allUp {
-			for _, idx := range indices {
-				if m.statuses[idx] != StatusDown {
-					m.services[idx].Stop(m.rootDir, m.pidsFile, m.composeProject)
-					count++
-				}
+		if len(toStart) > 0 {
+			for _, idx := range toStart {
+				services[idx].Start(rootDir, logDir, pidsFile, composeProject)
 			}
-			return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %d services in %s", count, sectionName)}
-		}
-		for _, idx := range indices {
-			if m.statuses[idx] == StatusDown {
-				m.services[idx].Start(m.rootDir, m.logDir, m.pidsFile, m.composeProject)
-				count++
+			return actionDoneMsg{
+				message:        fmt.Sprintf("▲ Started %d services in %s", len(toStart), sectionName),
+				startedIndices: toStart,
 			}
 		}
-		return actionDoneMsg{message: fmt.Sprintf("▲ Started %d services in %s", count, sectionName)}
+		for _, idx := range toStop {
+			services[idx].Stop(rootDir, pidsFile, composeProject)
+		}
+		return actionDoneMsg{
+			message:        fmt.Sprintf("▼ Stopped %d services in %s", len(toStop), sectionName),
+			stoppedIndices: toStop,
+		}
 	}
 }
 
@@ -470,28 +665,39 @@ func (m model) killPortCmd(idx int) tea.Cmd {
 }
 
 func (m model) startAll() tea.Cmd {
-	return func() tea.Msg {
-		count := 0
-		for i, svc := range m.services {
-			if m.statuses[i] == StatusDown {
-				svc.Start(m.rootDir, m.logDir, m.pidsFile, m.composeProject)
-				count++
-			}
+	var toStart []int
+	for i := range m.services {
+		if m.statuses[i] == StatusDown {
+			toStart = append(toStart, i)
 		}
-		return actionDoneMsg{message: fmt.Sprintf("▲ Started %d services", count)}
+	}
+	rootDir := m.rootDir
+	logDir := m.logDir
+	pidsFile := m.pidsFile
+	composeProject := m.composeProject
+	services := m.services
+
+	return func() tea.Msg {
+		for _, idx := range toStart {
+			services[idx].Start(rootDir, logDir, pidsFile, composeProject)
+		}
+		return actionDoneMsg{
+			message:        fmt.Sprintf("▲ Started %d services", len(toStart)),
+			startedIndices: toStart,
+		}
 	}
 }
 
 func (m model) stopAll() tea.Cmd {
 	return func() tea.Msg {
-		count := 0
+		var stopped []int
 		for i, svc := range m.services {
 			if m.statuses[i] != StatusDown {
 				svc.Stop(m.rootDir, m.pidsFile, m.composeProject)
-				count++
+				stopped = append(stopped, i)
 			}
 		}
-		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %d services", count)}
+		return actionDoneMsg{message: fmt.Sprintf("▼ Stopped %d services", len(stopped)), stoppedIndices: stopped}
 	}
 }
 
@@ -567,10 +773,21 @@ func (m model) viewListScreen() string {
 			badgeText = upBadge.Render("  UP")
 		case StatusExternal:
 			dot = dotExt
-			badgeText = extBadge.Render(" EXT")
+			if n := m.retryCount[r.serviceIdx]; n > 0 {
+				badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
+			} else {
+				badgeText = extBadge.Render(" EXT")
+			}
+		case StatusStarting:
+			dot = dotStarting
+			badgeText = startingBadge.Render("STARTING")
 		default:
 			dot = dotDown
-			badgeText = downBadge.Render("DOWN")
+			if n := m.retryCount[r.serviceIdx]; n > 0 {
+				badgeText = retryBadge.Render(fmt.Sprintf("RETRY (%d)", n))
+			} else {
+				badgeText = downBadge.Render("DOWN")
+			}
 		}
 
 		name := fmt.Sprintf("%-28s", svc.Name)
@@ -616,12 +833,13 @@ func (m model) viewListScreen() string {
 	}
 
 	help := fmt.Sprintf(
-		"  %s navigate  %s start/stop (group on section)  %s logs  %s open  %s kill port\n  %s start all  %s stop all  %s quit",
+		"  %s navigate  %s start/stop  %s logs  %s open  %s kill port  %s folder\n  %s start all  %s stop all  %s quit",
 		helpKey.Render("↑↓"),
 		helpKey.Render("Enter"),
 		helpKey.Render("L"),
 		helpKey.Render("O"),
 		helpKey.Render("Shift+K"),
+		helpKey.Render("F"),
 		helpKey.Render("S"),
 		helpKey.Render("X"),
 		helpKey.Render("Q"),
@@ -633,7 +851,10 @@ func (m model) viewListScreen() string {
 
 func (m model) viewLogScreen() string {
 	var b strings.Builder
-
+	if m.logService < 0 || m.logService >= len(m.services) {
+		b.WriteString(logHeaderStyle.Render("  Invalid service · Q back") + "\n")
+		return b.String()
+	}
 	svc := m.services[m.logService]
 
 	scrollHint := ""
