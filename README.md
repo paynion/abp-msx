@@ -17,18 +17,72 @@ Lightweight TUI to run and manage [ABP Framework](https://abp.io) microservice s
 
 ## Install
 
-1. Open the [Releases](https://github.com/paynion/abp-msx/releases) page and download the executable that matches your operating system and architecture (e.g. `abp-msx-linux-amd64`, `abp-msx-darwin-arm64`, `abp-msx-windows-amd64.exe`).
-2. Rename the file to **`abp-msx`** (on Windows: **`abp-msx.exe`**).
-3. Move it to a directory that is in your [PATH](https://en.wikipedia.org/wiki/PATH_(variable)) so you can run it from any terminal:
-   - **Linux / macOS:** e.g. `~/bin` or `/usr/local/bin`  
-     `mv abp-msx-linux-amd64 ~/bin/abp-msx` then ensure `~/bin` is in your PATH.
-   - **Windows:** e.g. `C:\Program Files\abp-msx` or a folder already in PATH — add that folder to [System PATH](https://docs.microsoft.com/en-us/windows/win32/progthand/environment-variables) if needed.
+### macOS
 
-After that, you can run from any terminal:
+1. Open the [Releases](https://github.com/paynion/abp-msx/releases) page and download the binary that matches your Mac:
+   - Apple Silicon (M1/M2/M3): `abp-msx-darwin-arm64`
+   - Intel: `abp-msx-darwin-amd64`
+2. In **Terminal**, go to your download folder and make it executable:
 
-```bash
-abp-msx -d /path/to/your/abp-solution
-```
+   ```bash
+   cd ~/Downloads
+   chmod +x abp-msx-darwin-arm64   # or abp-msx-darwin-amd64
+   ```
+
+3. Move it to a directory on your `PATH` and name it `abp-msx`:
+
+   ```bash
+   sudo mv abp-msx-darwin-arm64 /usr/local/bin/abp-msx
+   # on most macOS setups /usr/local/bin is already on PATH
+   ```
+
+4. Test:
+
+   ```bash
+   abp-msx -d /path/to/your/abp-solution
+   ```
+
+> If you see `permission denied`, you probably skipped the `chmod +x` step.  
+> If you see `command not found`, check that `/usr/local/bin` is in your `PATH` (`echo $PATH`).
+
+### Linux
+
+1. From Releases, download the Linux binary (`abp-msx-linux-amd64` or `abp-msx-linux-arm64`).
+2. Go to the download folder and make it executable:
+
+   ```bash
+   cd ~/Downloads
+   chmod +x abp-msx-linux-amd64   # or abp-msx-linux-arm64
+   ```
+
+3. Move it to a directory on your `PATH`:
+
+   ```bash
+   sudo mv abp-msx-linux-amd64 /usr/local/bin/abp-msx
+   # user-only example:
+   # mkdir -p ~/.local/bin
+   # mv abp-msx-linux-amd64 ~/.local/bin/abp-msx
+   ```
+
+4. Run:
+
+   ```bash
+   abp-msx -d /path/to/your/abp-solution
+   ```
+
+> If you installed into `~/.local/bin` and the command is not found, add this to your shell config:  
+> `export PATH=\"$HOME/.local/bin:$PATH\"`
+
+### Windows
+
+1. From Releases, download the Windows binary (e.g. `abp-msx-windows-amd64.exe`).
+2. Optionally rename it to `abp-msx.exe`.
+3. Move `abp-msx.exe` into a folder on your **System PATH** (for example `C:\Tools\abp-msx\abp-msx.exe`) and add that folder to PATH if needed.
+4. In PowerShell or CMD:
+
+   ```powershell
+   abp-msx -d C:\path\to\your\abp-solution
+   ```
 
 ### Build from source
 

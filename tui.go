@@ -156,14 +156,25 @@ var (
 	cachedDarkBg       bool
 )
 
+const themeDetectTimeout = 500 * time.Millisecond
+
 // InitTheme detects dark/light background once. Call from main before tea.Run() so termenv doesn't run during TUI (can block).
+// If detection blocks (e.g. in some terminals), it times out and defaults to dark.
 func InitTheme() {
 	_ = hasDarkBackground()
 }
 
 func hasDarkBackground() bool {
 	darkBackgroundOnce.Do(func() {
-		cachedDarkBg = termenv.NewOutput(os.Stdout).HasDarkBackground()
+		result := make(chan bool, 1)
+		go func() {
+			result <- termenv.NewOutput(os.Stdout).HasDarkBackground()
+		}()
+		select {
+		case cachedDarkBg = <-result:
+		case <-time.After(themeDetectTimeout):
+			cachedDarkBg = true // default dark so TUI doesn't hang
+		}
 	})
 	return cachedDarkBg
 }
